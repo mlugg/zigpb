@@ -36,9 +36,12 @@ fn expectEqualMessages(comptime T: type, expected: T, actual: T) !void {
         return;
     }
 
-    switch (T) {
-        u32, i32, u64, i64, f32, f64 => try std.testing.expectEqual(expected, actual),
-        []const u8, []u8 => try std.testing.expectEqualSlices(u8, expected, actual),
+    if (T == []const u8 or T == []u8) {
+        return std.testing.expectEqualSlices(u8, expected, actual);
+    }
+
+    switch (@typeInfo(T)) {
+        .Int, .Float, .Enum => try std.testing.expectEqual(expected, actual),
         else => @compileError("Cannot test equality of type '" ++ @typeName(T) ++ "'"),
     }
 }
@@ -134,6 +137,11 @@ test {
                 .y = .{ 2, .zigzag },
             };
         },
+        en: enum {
+            val1,
+            val2,
+            val3,
+        },
 
         pub const pb_desc = .{
             .single1 = .{ 1, .varint },
@@ -142,6 +150,7 @@ test {
             .rep = .{ 3, .{ .repeat_pack = .zigzag } },
             .map = .{ 4, .{ .map = .{ .string, .default } } },
             .embedded = .{ 6, .default },
+            .en = .{ 7, .default },
         };
     }, .{
         .single1 = 256,
@@ -160,5 +169,6 @@ test {
             .x = 1 << 20,
             .y = -2048,
         },
+        .en = .val2,
     });
 }

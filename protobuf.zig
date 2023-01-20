@@ -82,6 +82,22 @@ fn encodeTag(w: anytype, field_num: u29, wire_type: WireType) !void {
 fn encodeSingleScalar(w: anytype, val: anytype, comptime desc: FieldDescriptor, comptime encode_default: bool, comptime override_default: ?@TypeOf(val), comptime include_tag: bool) !void {
     const T = @TypeOf(val);
 
+    if (@typeInfo(T) == .Enum) {
+        if (desc.encoding != .default) @compileError("Enum types must use FieldEncoding.default");
+        const Tag = @typeInfo(T).Enum.tag_type;
+        if (@bitSizeOf(Tag) > 32) @compileError("Enum types must have a tag type of no more than 32 bits");
+        const Tag32 = if (@typeInfo(Tag).Int.signedness == .signed) i32 else u32;
+        const ival: Tag32 = @enumToInt(val);
+        return encodeSingleScalar(
+            w,
+            ival,
+            .{ .field_num = desc.field_num, .encoding = .varint },
+            encode_default,
+            if (override_default) |x| @enumToInt(x) else null,
+            include_tag,
+        );
+    }
+
     switch (T) {
         bool => {
             if (desc.encoding != .default) @compileError("Boolean types must use FieldEncoding.default");
@@ -352,6 +368,11 @@ fn initDefault(comptime Msg: type, arena: std.mem.Allocator) Msg {
         @field(result, field.name) = switch (@typeInfo(field.type)) {
             .Optional => default orelse null,
             .Int, .Float => default orelse 0,
+            .Enum => |e| default orelse if (e.is_exhaustive)
+                comptime std.meta.intToEnum(field.type, 0) catch
+                    @compileError("Enum '" ++ @typeName(field.type) ++ "' has no 0 default")
+            else
+                @intToEnum(field.type, 0),
             .Bool => default orelse false,
             .Struct => if (comptime getPbDesc(field.type) != null)
                 initDefault(field.type, arena)
@@ -401,6 +422,19 @@ fn skipField(r: anytype, wire_type: WireType, field_num: u29) !void {
 }
 
 fn decodeSingleScalar(comptime T: type, comptime encoding: FieldEncoding, r: anytype, arena: std.mem.Allocator, wire_type: WireType) !T {
+    if (@typeInfo(T) == .Enum) {
+        if (encoding != .default) @compileError("Enum types must use FieldEncoding.default");
+        const Tag = @typeInfo(T).Enum.tag_type;
+        if (@bitSizeOf(Tag) > 32) @compileError("Enum types must have a tag type of no more than 32 bits");
+        const Tag32 = if (@typeInfo(Tag).Int.signedness == .signed) i32 else u32;
+        const ival = try decodeSingleScalar(Tag32, .varint, r, arena, wire_type);
+        if (@typeInfo(T).Enum.is_exhaustive) {
+            return std.meta.intToEnum(T, ival) catch return error.UnknownEnumTag;
+        } else {
+            return @intToEnum(T, ival);
+        }
+    }
+
     switch (T) {
         bool => {
             if (encoding != .default) @compileError("Boolean types must use FieldEncoding.default");
