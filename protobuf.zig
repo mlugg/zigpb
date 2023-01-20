@@ -1,31 +1,17 @@
 const std = @import("std");
 
-/// Convenience wrapper for constructing FieldDescriptors.
-/// TODO I hate this
-pub fn fd(field_num: u29, encoding: FieldEncoding) FieldDescriptor {
-    return .{
-        .field_num = field_num,
-        .encoding = encoding,
-    };
-}
-
-/// Convenience wrapper for making sure we get FieldEncoding and not the corresponding enum tag.
-/// TODO I hate this
-pub fn fe(encoding: FieldEncoding) FieldEncoding {
-    return encoding;
-}
-
 /// Describes how a single struct field is encoded. For 'repeated' fields, this specifies whether
 /// the values are packed; otherwise it just tells us the representation of the actual type (e.g.
 /// to differentiate between u32 and fixed32).
-pub const FieldEncoding = union(enum) {
+/// If modifying this, also look at createFieldEncoding!
+const FieldEncoding = union(enum) {
     default, // bool; float/double (f32/f64); submessage (struct with pb_desc)
     fixed, // [s]fixed[32/64]
     varint, // [u]int[32/64]
     zigzag, // sint[32/64]
     string, // string
-    repeat_pack: *const FieldEncoding, // repeated (child encoding)
     repeat: *const FieldEncoding, // repeated (child encoding)
+    repeat_pack: *const FieldEncoding, // repeated (child encoding)
     bytes, // bytes
     map: [*]const FieldEncoding, //*const [2]FieldEncoding, // map (k/v encodings)
 };
@@ -34,7 +20,7 @@ pub const FieldEncoding = union(enum) {
 /// a 'pb_desc' decl on the message struct. 'oneof' values, represented as optional tagged unions,
 /// are the only field type which should not have a corresponding descriptor index, but they must
 /// contain their own 'pb_desc' decl describing the fields within them.
-pub const FieldDescriptor = struct {
+const FieldDescriptor = struct {
     field_num: u29,
     encoding: FieldEncoding,
 };
@@ -214,13 +200,12 @@ fn encodeAnyField(
         const U = std.meta.Child(T);
         if (desc_opt != null) @compileError("Union '" ++ field_name ++ "' must not have a field descriptor");
         if (val) |un| {
-            if (!@hasDecl(U, "pb_desc")) @compileError("Union 'must have a pb_desc decl");
+            const pb_desc = comptime getPbDesc(U) orelse @compileError("Union '" ++ @typeName(U) ++ "' must have a pb_desc decl");
             switch (un) {
                 inline else => |payload, tag| {
-                    if (!@hasField(@TypeOf(U.pb_desc), @tagName(tag))) {
+                    const sub_desc = comptime pb_desc.getField(@tagName(tag)) orelse
                         @compileError("Mising descriptor for field '" ++ @typeName(U) ++ "." ++ @tagName(tag) ++ "'");
-                    }
-                    const sub_desc = @field(U.pb_desc, @tagName(tag));
+
                     try encodeSingleValue(w, ally, payload, sub_desc, true, null);
                 },
             }
@@ -259,8 +244,8 @@ fn encodeAnyField(
                 k: std.meta.FieldType(T.KV, .key),
                 v: std.meta.FieldType(T.KV, .value),
                 const pb_desc = .{
-                    .k = fd(1, desc.encoding.map[0]),
-                    .v = fd(2, desc.encoding.map[1]),
+                    .k = .{ 1, desc.encoding.map[0] },
+                    .v = .{ 2, desc.encoding.map[1] },
                 };
             }{ .k = pair.key_ptr.*, .v = pair.value_ptr.* }, .{
                 .field_num = desc.field_num,
@@ -280,15 +265,13 @@ fn encodeAnyField(
 /// performed, all of which are cleaned up before this function returns.
 pub fn encodeMessage(w: anytype, ally: std.mem.Allocator, msg: anytype) !void {
     const Msg = @TypeOf(msg);
-    if (!@hasDecl(Msg, "pb_desc")) @compileError("Message type '" ++ @typeName(Msg) ++ "' must have a pb_desc decl");
+    const pb_desc = comptime getPbDesc(Msg) orelse
+        @compileError("Message type '" ++ @typeName(Msg) ++ "' must have a pb_desc decl");
 
     validateDescriptors(Msg);
 
     inline for (@typeInfo(Msg).Struct.fields) |field| {
-        const desc: ?FieldDescriptor = if (@hasField(@TypeOf(Msg.pb_desc), field.name))
-            @field(Msg.pb_desc, field.name)
-        else
-            null;
+        const desc: ?FieldDescriptor = comptime pb_desc.getField(field.name);
 
         const default: ?field.type = if (field.default_value) |ptr|
             @ptrCast(*const field.type, ptr).*
@@ -316,22 +299,21 @@ fn validateDescriptors(comptime Msg: type) void {
 }
 
 fn validateDescriptorsInner(comptime Msg: type, comptime seen_field_nums: *[]const u29) void {
-    for (std.meta.fieldNames(@TypeOf(Msg.pb_desc))) |name| {
+    const pb_desc = comptime getPbDesc(Msg).?;
+    for (pb_desc.fields) |field_desc| {
+        const name = field_desc[0];
         if (!@hasField(Msg, name)) {
             @compileError("Descriptor '" ++ name ++ "' does not correspond to any field in type '" + @typeName(Msg));
         }
+        seen_field_nums.* = seen_field_nums.* ++ &[1]u29{field_desc[1].field_num};
     }
 
     for (std.meta.fields(Msg)) |field| {
-        if (@hasField(@TypeOf(Msg.pb_desc), field.name)) {
-            seen_field_nums.* = seen_field_nums.* ++ &[1]u29{@field(Msg.pb_desc, field.name).field_num};
-        }
-
-        if (@typeInfo(field.type) == .Struct and @hasDecl(field.type, "pb_desc")) {
+        if (@typeInfo(field.type) == .Struct and comptime getPbDesc(field.type) != null) {
             validateDescriptors(field.type);
         } else if (@typeInfo(field.type) == .Optional and
             @typeInfo(std.meta.Child(field.type)) == .Union and
-            @hasDecl(std.meta.Child(field.type), "pb_desc"))
+            comptime getPbDesc(std.meta.Child(field.type)) != null)
         {
             validateDescriptorsInner(std.meta.Child(field.type), seen_field_nums);
         }
@@ -371,7 +353,7 @@ fn initDefault(comptime Msg: type, arena: std.mem.Allocator) Msg {
             .Optional => default orelse null,
             .Int, .Float => default orelse 0,
             .Bool => default orelse false,
-            .Struct => if (@hasDecl(field.type, "pb_desc"))
+            .Struct => if (comptime getPbDesc(field.type) != null)
                 initDefault(field.type, arena)
             else
                 field.type{},
@@ -575,8 +557,8 @@ fn maybeDecodeAnyField(comptime T: type, comptime desc_opt: ?FieldDescriptor, co
             k: std.meta.FieldType(T.KV, .key),
             v: std.meta.FieldType(T.KV, .value),
             const pb_desc = .{
-                .k = fd(1, desc.encoding.map[0]),
-                .v = fd(2, desc.encoding.map[1]),
+                .k = .{ 1, desc.encoding.map[0] },
+                .v = .{ 2, desc.encoding.map[1] },
             };
         }, .default, r, arena, wire_type);
         try result.put(arena, val.k, val.v);
@@ -590,13 +572,12 @@ fn maybeDecodeAnyField(comptime T: type, comptime desc_opt: ?FieldDescriptor, co
 }
 
 fn maybeDecodeOneOf(comptime U: type, r: anytype, arena: std.mem.Allocator, wire_type: WireType, field_num: u29) !?U {
-    if (!@hasDecl(U, "pb_desc")) @compileError("Union must have a pb_desc decl");
+    const pb_desc = comptime getPbDesc(U) orelse
+        @compileError("Union '" ++ @typeName(U) ++ "' must have a pb_desc decl");
 
     inline for (std.meta.fields(U)) |field| {
-        if (!@hasField(@TypeOf(U.pb_desc), field.name)) {
+        const desc = comptime pb_desc.getField(field.name) orelse
             @compileError("Missing descriptor for field '" ++ @typeName(U) ++ "." ++ field.name ++ "'");
-        }
-        const desc = @field(U.pb_desc, field.name);
 
         if (desc.field_num == field_num) {
             const payload = try decodeSingleValue(field.type, desc.encoding, r, arena, wire_type);
@@ -608,7 +589,7 @@ fn maybeDecodeOneOf(comptime U: type, r: anytype, arena: std.mem.Allocator, wire
 }
 
 fn decodeMessageInner(comptime Msg: type, r: anytype, arena: std.mem.Allocator) !Msg {
-    if (!@hasDecl(Msg, "pb_desc")) @compileError("Message type '" ++ @typeName(Msg) ++ "' must have a pb_desc decl");
+    const pb_desc = comptime getPbDesc(Msg) orelse @compileError("Message type '" ++ @typeName(Msg) ++ "' must have a pb_desc decl");
     validateDescriptors(Msg);
 
     var result = initDefault(Msg, arena);
@@ -618,10 +599,7 @@ fn decodeMessageInner(comptime Msg: type, r: anytype, arena: std.mem.Allocator) 
         const field_num = std.math.cast(u29, tag >> 3) orelse return error.MalformedInput;
 
         inline for (std.meta.fields(Msg)) |field| {
-            const desc_opt: ?FieldDescriptor = if (@hasField(@TypeOf(Msg.pb_desc), field.name))
-                @field(Msg.pb_desc, field.name)
-            else
-                null;
+            const desc_opt: ?FieldDescriptor = comptime pb_desc.getField(field.name);
 
             if (try maybeDecodeAnyField(field.type, desc_opt, @typeName(Msg) ++ "." ++ field.name, r, arena, wire_type, field_num, &@field(result, field.name))) {
                 break;
@@ -645,4 +623,81 @@ pub fn decodeMessage(comptime Msg: type, r: anytype, ally: std.mem.Allocator) !D
         .msg = try decodeMessageInner(Msg, r, arena.allocator()),
         .arena = arena,
     };
+}
+
+const PbDesc = struct {
+    const Entry = struct { []const u8, FieldDescriptor };
+    fields: []const Entry,
+
+    fn getField(self: PbDesc, name: []const u8) ?FieldDescriptor {
+        for (self.fields) |f| {
+            if (std.mem.eql(u8, f[0], name)) return f[1];
+        }
+        return null;
+    }
+};
+
+// Directly making a pb_desc with fields of type FieldDescriptor is quite inconvenient, so instead
+// we'll take big literals in the same shape and parse them into the real descriptors.
+
+fn getPbDesc(comptime T: type) ?PbDesc {
+    comptime {
+        if (!@hasDecl(T, "pb_desc")) return null;
+        const desc = T.pb_desc;
+
+        var fields: []const PbDesc.Entry = &.{};
+
+        for (std.meta.fields(@TypeOf(desc))) |field| {
+            const fd = createFieldDesc(@field(desc, field.name), @typeName(T) ++ "." ++ field.name);
+            fields = fields ++ &[1]PbDesc.Entry{.{ field.name, fd }};
+        }
+
+        return .{ .fields = fields };
+    }
+}
+
+fn createFieldDesc(comptime desc: anytype, comptime field_name: []const u8) FieldDescriptor {
+    if (!std.meta.trait.isTuple(@TypeOf(desc))) {
+        @compileError("Bad descriptor format for field '" ++ field_name ++ "'");
+    }
+
+    return .{
+        .field_num = desc[0],
+        .encoding = createFieldEncoding(desc[1], field_name),
+    };
+}
+
+fn createFieldEncoding(comptime enc: anytype, comptime field_name: []const u8) FieldEncoding {
+    if (@TypeOf(enc) == FieldEncoding) {
+        return enc;
+    } else if (@TypeOf(enc) == @Type(.EnumLiteral)) {
+        // try to match with an encoding type
+        for (std.meta.fields(FieldEncoding)) |field| {
+            if (std.mem.eql(u8, @tagName(enc), field.name)) {
+                return @field(FieldEncoding, field.name);
+            }
+        }
+    } else if (@typeInfo(@TypeOf(enc)) == .Struct) {
+        // nested encoding types
+        const fields = @typeInfo(@TypeOf(enc)).Struct.fields;
+        if (fields.len == 1) {
+            const tag = fields[0].name;
+            const val = @field(enc, tag);
+            if (std.mem.eql(u8, tag, "repeat")) {
+                const child = createFieldEncoding(val, field_name);
+                return .{ .repeat = &child };
+            } else if (std.mem.eql(u8, tag, "repeat_pack")) {
+                const child = createFieldEncoding(val, field_name);
+                return .{ .repeat_pack = &child };
+            } else if (std.mem.eql(u8, tag, "map")) {
+                if (std.meta.trait.isTuple(@TypeOf(val)) and val.len == 2) {
+                    const child0 = createFieldEncoding(val[0], field_name);
+                    const child1 = createFieldEncoding(val[1], field_name);
+                    return .{ .map = &[2]FieldEncoding{ child0, child1 } };
+                }
+            }
+        }
+    }
+
+    @compileError("Bad encoding for field '" ++ field_name ++ "'");
 }

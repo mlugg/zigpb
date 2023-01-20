@@ -122,26 +122,26 @@ test {
             foo: u32,
             bar: []const u8,
             pub const pb_desc = .{
-                .foo = pb.fd(5, .varint),
-                .bar = pb.fd(10, .bytes),
+                .foo = .{ 5, .varint },
+                .bar = .{ 10, .bytes },
             };
         },
         embedded: struct {
             x: u32,
             y: i64,
             pub const pb_desc = .{
-                .x = pb.fd(1, .varint),
-                .y = pb.fd(2, .zigzag),
+                .x = .{ 1, .varint },
+                .y = .{ 2, .zigzag },
             };
         },
 
         pub const pb_desc = .{
-            .single1 = pb.fd(1, .varint),
-            .single2 = pb.fd(42, .fixed),
-            .opt = pb.fd(2, .varint),
-            .rep = pb.fd(3, .{ .repeat_pack = &pb.fe(.zigzag) }),
-            .map = pb.fd(4, .{ .map = &[2]pb.FieldEncoding{ .string, .default } }),
-            .embedded = pb.fd(6, .default),
+            .single1 = .{ 1, .varint },
+            .single2 = .{ 42, .fixed },
+            .opt = .{ 2, .varint },
+            .rep = .{ 3, .{ .repeat_pack = .zigzag } },
+            .map = .{ 4, .{ .map = .{ .string, .default } } },
+            .embedded = .{ 6, .default },
         };
     }, .{
         .single1 = 256,
