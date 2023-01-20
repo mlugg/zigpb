@@ -1,72 +1,164 @@
 const std = @import("std");
 const pb = @import("protobuf.zig");
 
-const Example = struct {
-    single1: u32,
-    single2: u32,
-    opt: ?u64,
-    rep: []i32,
-    map: pb.Map([]const u8, f32),
-    options: ?union(enum) {
-        foo: u32,
-        bar: []const u8,
+fn expectEqualMessages(comptime T: type, expected: T, actual: T) !void {
+    if (@typeInfo(T) == .Optional) {
+        try std.testing.expectEqual(expected == null, actual == null);
+        return expectEqualMessages(std.meta.Child(T), expected.?, actual.?);
+    }
 
-        pub const pb_desc = .{
-            .foo = pb.fd(5, .varint),
-            .bar = pb.fd(10, .bytes),
-        };
-    },
+    if (@typeInfo(T) == .Union) {
+        try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+        switch (expected) {
+            inline else => |val, tag| {
+                return expectEqualMessages(@TypeOf(val), val, @field(actual, @tagName(tag)));
+            },
+        }
+    }
 
-    pub const pb_desc = .{
-        .single1 = pb.fd(1, .varint),
-        .single2 = pb.fd(42, .fixed),
-        .opt = pb.fd(2, .varint),
-        .rep = pb.fd(3, .{ .repeat_pack = &pb.fe(.zigzag) }),
-        .map = pb.fd(4, .{ .map = &[2]pb.FieldEncoding{ .string, .default } }),
-    };
-};
+    if (@typeInfo(T) == .Struct) {
+        if (@hasDecl(T, "pb_desc")) {
+            inline for (comptime std.meta.fields(T)) |field| {
+                try expectEqualMessages(field.type, @field(expected, field.name), @field(actual, field.name));
+            }
+        } else if (@hasDecl(T, "GetOrPutResult")) {
+            try std.testing.expectEqual(expected.count(), actual.count());
+            var it = expected.iterator();
+            while (it.next()) |pair| {
+                const val = actual.get(pair.key_ptr.*) orelse return error.TestExpectedEqual;
+                try std.testing.expectEqual(pair.value_ptr.*, val);
+            }
+        } else if (@hasDecl(T, "Slice")) {
+            try std.testing.expectEqualSlices(std.meta.Child(T.Slice), expected.items, actual.items);
+        } else {
+            @compileError("Cannot test equality of type '" ++ @typeName(T) ++ "'");
+        }
+        return;
+    }
 
-test {
-    var rep = [3]i32{ 69, 0, 42 };
+    switch (T) {
+        u32, i32, u64, i64, f32, f64 => try std.testing.expectEqual(expected, actual),
+        []const u8, []u8 => try std.testing.expectEqualSlices(u8, expected, actual),
+        else => @compileError("Cannot test equality of type '" ++ @typeName(T) ++ "'"),
+    }
+}
 
-    var map = pb.Map([]const u8, f32).init(std.testing.allocator);
-    defer map.deinit();
+fn initMessage(comptime T: type, comptime val: anytype, arena: std.mem.Allocator) !T {
+    if (@typeInfo(T) == .Optional) {
+        if (@typeInfo(@TypeOf(val)) == .Optional) {
+            return if (val) |x| try initMessage(std.meta.Child(T), x, arena) else null;
+        } else {
+            return try initMessage(std.meta.Child(T), val, arena);
+        }
+    }
 
-    try map.put("hello", 1);
-    try map.put("", 2);
-    try map.put("this has\x00embedded nuls", 3);
+    if (@typeInfo(T) == .Union) {
+        if (@typeInfo(@TypeOf(val)) != .Struct) @compileError("Expected struct literal to initialize union");
+        const fields = @typeInfo(@TypeOf(val)).Struct.fields;
+        if (fields.len != 1) @compileError("Expected single-element struct to initialize union");
+        return @unionInit(T, fields[0].name, try initMessage(
+            std.meta.TagPayload(T, @field(std.meta.Tag(T), fields[0].name)),
+            @field(val, fields[0].name),
+            arena,
+        ));
+    }
 
-    const ex: Example = .{
-        .single1 = 256,
-        .single2 = 0,
-        .opt = 0,
-        .rep = &rep,
-        .map = map,
-        .options = .{ .bar = "ziggify all the kingdoms" },
-    };
+    if (@typeInfo(T) == .Struct) {
+        if (@hasDecl(T, "pb_desc")) {
+            var result: T = undefined;
+            inline for (comptime std.meta.fields(T)) |field| {
+                @field(result, field.name) = try initMessage(field.type, @field(val, field.name), arena);
+            }
+            return result;
+        } else if (@hasDecl(T, "GetOrPutResult")) {
+            var result: T = .{};
+            inline for (val) |pair| {
+                try result.put(arena, pair[0], pair[1]);
+            }
+            return result;
+        } else if (@hasDecl(T, "Slice")) {
+            var result: T = .{};
+            try result.appendSlice(arena, &val);
+            return result;
+        } else {
+            @compileError("Cannot initalize type '" ++ @typeName(T) ++ "'");
+        }
+        return;
+    }
+
+    if (T == []u8 and @TypeOf(val) == []const u8) {
+        return arena.dupe(val);
+    } else {
+        return val;
+    }
+}
+
+fn testEncodeDecode(comptime Msg: type, comptime val: anytype) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const msg = try initMessage(Msg, val, arena.allocator());
 
     var buf = std.ArrayList(u8).init(std.testing.allocator);
     defer buf.deinit();
 
-    try pb.encodeMessage(buf.writer(), std.testing.allocator, ex);
+    try pb.encodeMessage(buf.writer(), std.testing.allocator, msg);
 
     var fbs = std.io.fixedBufferStream(buf.items);
-    const decoded = try pb.decodeMessage(Example, fbs.reader(), std.testing.allocator);
+    const decoded = try pb.decodeMessage(Msg, fbs.reader(), std.testing.allocator);
     defer decoded.deinit();
 
-    try std.testing.expectEqual(ex.single1, decoded.msg.single1);
-    try std.testing.expectEqual(ex.single2, decoded.msg.single2);
-    try std.testing.expectEqual(ex.opt, decoded.msg.opt);
-    try std.testing.expectEqualSlices(i32, ex.rep, decoded.msg.rep);
-    try std.testing.expectEqual(ex.map.count(), decoded.msg.map.count());
+    try expectEqualMessages(Msg, msg, decoded.msg);
+}
 
-    var it = ex.map.iterator();
-    while (it.next()) |pair| {
-        const other = decoded.msg.map.get(pair.key_ptr.*) orelse return error.TestExpectedEqual;
-        try std.testing.expectEqual(pair.value_ptr.*, other);
-    }
+test {
+    try testEncodeDecode(struct {
+        single1: u32,
+        single2: u32,
+        opt: ?u64,
+        rep: std.ArrayListUnmanaged(i32),
+        map: pb.Map([]const u8, f32),
+        options: ?union(enum) {
+            foo: u32,
+            bar: []const u8,
+            pub const pb_desc = .{
+                .foo = pb.fd(5, .varint),
+                .bar = pb.fd(10, .bytes),
+            };
+        },
+        embedded: struct {
+            x: u32,
+            y: i64,
+            pub const pb_desc = .{
+                .x = pb.fd(1, .varint),
+                .y = pb.fd(2, .zigzag),
+            };
+        },
 
-    try std.testing.expect(ex.options != null);
-    try std.testing.expectEqual(std.meta.activeTag(ex.options.?), std.meta.activeTag(decoded.msg.options.?));
-    try std.testing.expectEqualSlices(u8, ex.options.?.bar, decoded.msg.options.?.bar);
+        pub const pb_desc = .{
+            .single1 = pb.fd(1, .varint),
+            .single2 = pb.fd(42, .fixed),
+            .opt = pb.fd(2, .varint),
+            .rep = pb.fd(3, .{ .repeat_pack = &pb.fe(.zigzag) }),
+            .map = pb.fd(4, .{ .map = &[2]pb.FieldEncoding{ .string, .default } }),
+            .embedded = pb.fd(6, .default),
+        };
+    }, .{
+        .single1 = 256,
+        .single2 = 0,
+        .opt = 0,
+        .rep = .{ 69, 0, 42 },
+        .map = .{
+            .{ "hello", 1 },
+            .{ "", 2 },
+            .{ "this has\x00embedded nuls", 3 },
+        },
+        .options = .{
+            .bar = "ziggify all the kingdoms",
+        },
+        .embedded = .{
+            .x = 1 << 20,
+            .y = -2048,
+        },
+    });
 }

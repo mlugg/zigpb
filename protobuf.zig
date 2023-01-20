@@ -41,7 +41,7 @@ pub const FieldDescriptor = struct {
 
 /// Convenience wrapper for constructing protobuf maps.
 pub fn Map(comptime K: type, comptime V: type) type {
-    return std.HashMap(K, V, struct {
+    return std.HashMapUnmanaged(K, V, struct {
         pub fn hash(_: @This(), key: K) u64 {
             var hasher = std.hash.Wyhash.init(0);
             std.hash.autoHashStrat(&hasher, key, .Deep);
@@ -242,7 +242,7 @@ fn encodeAnyField(
         var buf = std.ArrayList(u8).init(ally);
         defer buf.deinit();
 
-        for (val) |x| {
+        for (val.items) |x| {
             try encodeSingleScalar(buf.writer(), x, .{
                 .field_num = desc.field_num,
                 .encoding = desc.encoding.repeat_pack.*,
@@ -328,7 +328,7 @@ fn validateDescriptorsInner(comptime Msg: type, comptime seen_field_nums: *[]con
         }
 
         if (@typeInfo(field.type) == .Struct and @hasDecl(field.type, "pb_desc")) {
-            validateDescriptorsInner(field.type, seen_field_nums);
+            validateDescriptors(field.type);
         } else if (@typeInfo(field.type) == .Optional and
             @typeInfo(std.meta.Child(field.type)) == .Union and
             @hasDecl(std.meta.Child(field.type), "pb_desc"))
@@ -371,12 +371,10 @@ fn initDefault(comptime Msg: type, arena: std.mem.Allocator) Msg {
             .Optional => default orelse null,
             .Int, .Float => default orelse 0,
             .Bool => default orelse false,
-            .Struct => if (@hasDecl(field.type, "GetOrPutResult")) // try to check for a hashmap
-                field.type.init(arena)
-            else if (@hasDecl(field.type, "pb_desc"))
+            .Struct => if (@hasDecl(field.type, "pb_desc"))
                 initDefault(field.type, arena)
             else
-                @compileError("Struct '" ++ @typeName(field.type) ++ "' cannot be deserialized without a pb_desc decl"),
+                field.type{},
             else => @compileError("Type '" ++ @typeName(field.type) ++ "' cannot be deserialized"),
         };
     }
@@ -523,7 +521,7 @@ fn maybeDecodeAnyField(comptime T: type, comptime desc_opt: ?FieldDescriptor, co
     if (field_num != desc.field_num) return false;
 
     if (desc.encoding == .repeat or desc.encoding == .repeat_pack) {
-        const Elem = std.meta.Child(T);
+        const Elem = std.meta.Child(T.Slice);
         const scalar_elem = switch (@typeInfo(Elem)) {
             .Int, .Bool, .Float => true,
             else => Elem == []u8 or Elem == []const u8,
@@ -543,10 +541,14 @@ fn maybeDecodeAnyField(comptime T: type, comptime desc_opt: ?FieldDescriptor, co
                 const len = try decodeVarInt(r);
                 var lr = std.io.limitedReader(r, len);
                 const expect_wire: WireType = switch (child_enc) {
-                    .fixed => if (@bitSizeOf(T) == 32) .i32 else .i64,
+                    .fixed => switch (Elem) {
+                        u32, i32, f32 => .i32,
+                        u64, i64, f64 => .i64,
+                        else => undefined, // not unreachable to defer to nice error handling in decodeSingleScalar
+                    },
                     .varint, .zigzag => .varint,
                     .string, .bytes => .len,
-                    .default => switch (T) {
+                    .default => switch (Elem) {
                         bool => .varint,
                         f32 => .i32,
                         f64 => .i64,
@@ -555,11 +557,8 @@ fn maybeDecodeAnyField(comptime T: type, comptime desc_opt: ?FieldDescriptor, co
                     else => undefined,
                 };
 
-                while (decodeSingleScalar(Elem, child_enc, lr.reader(), arena, expect_wire)) |val| {
-                    // TODO inefficient (see below)
-                    const idx = result.*.len;
-                    result.* = try arena.realloc(result.*, idx + 1);
-                    result.*[idx] = val;
+                while (decodeSingleScalar(Elem, child_enc, lr.reader(), arena, expect_wire)) |elem| {
+                    try result.*.append(arena, elem);
                 } else |err| switch (err) {
                     error.EndOfStream => {},
                     else => |e| return e,
@@ -570,10 +569,7 @@ fn maybeDecodeAnyField(comptime T: type, comptime desc_opt: ?FieldDescriptor, co
         }
 
         const elem = try decodeSingleScalar(Elem, child_enc, r, arena, wire_type);
-        // TODO: this is really inefficient at the minute. should we use an ArrayList[Unmanged] rather than a slice for repeated fields?
-        const idx = result.*.len;
-        result.* = try arena.realloc(result.*, idx + 1);
-        result.*[idx] = elem;
+        try result.*.append(arena, elem);
     } else if (desc.encoding == .map) {
         const val = try decodeSingleValue(struct {
             k: std.meta.FieldType(T.KV, .key),
@@ -583,7 +579,7 @@ fn maybeDecodeAnyField(comptime T: type, comptime desc_opt: ?FieldDescriptor, co
                 .v = fd(2, desc.encoding.map[1]),
             };
         }, .default, r, arena, wire_type);
-        try result.put(val.k, val.v);
+        try result.put(arena, val.k, val.v);
     } else if (@typeInfo(T) == .Optional) {
         result.* = try decodeSingleValue(std.meta.Child(T), desc.encoding, r, arena, wire_type);
     } else {
@@ -601,8 +597,6 @@ fn maybeDecodeOneOf(comptime U: type, r: anytype, arena: std.mem.Allocator, wire
             @compileError("Missing descriptor for field '" ++ @typeName(U) ++ "." ++ field.name ++ "'");
         }
         const desc = @field(U.pb_desc, field.name);
-
-        std.log.info("checking union field " ++ field.name ++ " against num {}", .{field_num});
 
         if (desc.field_num == field_num) {
             const payload = try decodeSingleValue(field.type, desc.encoding, r, arena, wire_type);
